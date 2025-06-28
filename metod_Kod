@@ -1,0 +1,942 @@
+#include <windows.h>
+#include <commdlg.h>
+#include <commctrl.h>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <cmath>
+#include <map>
+#include <set>
+
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma execution_character_set("utf-8")
+
+// Константы для элементов интерфейса
+#define ID_LOAD_BUTTON 1001
+#define ID_CALCULATE_BUTTON 1002
+#define ID_SAVE_BUTTON 1003
+#define ID_COLUMN_LIST 1004
+#define ID_TARGET_COMBO 1005
+#define ID_LAMBDA_EDIT 1007
+#define ID_RESULTS_EDIT 1008
+#define ID_METHOD_OLS 1009
+#define ID_METHOD_RIDGE 1010
+#define ID_METHOD_HUBER 1011
+#define ID_METHOD_WEIGHTED 1012
+
+// Глобальные переменные
+HWND hMainWindow;
+HWND hLoadButton, hCalculateButton, hSaveButton;
+HWND hColumnList, hTargetCombo, hLambdaEdit;
+HWND hResultsEdit;
+HWND hMethodOLS, hMethodRidge, hMethodHuber, hMethodWeighted;
+std::vector<std::vector<std::string>> data;
+std::vector<std::string> columnNames;
+std::string resultsText;
+
+// Структуры данных
+struct RegressionResult {
+    std::vector<double> coefficients;
+    double r_squared;
+    double mape;
+    std::vector<double> predictions;
+    std::vector<double> residuals;
+};
+
+// Утилиты для работы со строками
+std::wstring StringToWString(const std::string& str) {
+    if (str.empty()) return std::wstring();
+    int size_needed = MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), NULL, 0);
+    std::wstring wstrTo(size_needed, 0);
+    MultiByteToWideChar(CP_UTF8, 0, &str[0], (int)str.size(), &wstrTo[0], size_needed);
+    return wstrTo;
+}
+
+std::string WStringToString(const std::wstring& wstr) {
+    if (wstr.empty()) return std::string();
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), NULL, 0, NULL, NULL);
+    std::string strTo(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, &wstr[0], (int)wstr.size(), &strTo[0], size_needed, NULL, NULL);
+    return strTo;
+}
+
+// Математические утилиты
+class MathUtils {
+public:
+    static std::vector<std::vector<double>> matrixMultiply(
+        const std::vector<std::vector<double>>& A,
+        const std::vector<std::vector<double>>& B) {
+
+        size_t rows_A = A.size();
+        size_t cols_A = A[0].size();
+        size_t cols_B = B[0].size();
+
+        std::vector<std::vector<double>> result(rows_A, std::vector<double>(cols_B, 0.0));
+
+        for (size_t i = 0; i < rows_A; i++) {
+            for (size_t j = 0; j < cols_B; j++) {
+                for (size_t k = 0; k < cols_A; k++) {
+                    result[i][j] += A[i][k] * B[k][j];
+                }
+            }
+        }
+        return result;
+    }
+
+    static std::vector<std::vector<double>> transpose(const std::vector<std::vector<double>>& matrix) {
+        size_t rows = matrix.size();
+        size_t cols = matrix[0].size();
+        std::vector<std::vector<double>> result(cols, std::vector<double>(rows));
+
+        for (size_t i = 0; i < rows; i++) {
+            for (size_t j = 0; j < cols; j++) {
+                result[j][i] = matrix[i][j];
+            }
+        }
+        return result;
+    }
+
+    static std::vector<std::vector<double>> inverse(const std::vector<std::vector<double>>& matrix) {
+        size_t n = matrix.size();
+        std::vector<std::vector<double>> augmented(n, std::vector<double>(2 * n, 0.0));
+
+        // Создаем расширенную матрицу [A|I]
+        for (size_t i = 0; i < n; i++) {
+            for (size_t j = 0; j < n; j++) {
+                augmented[i][j] = matrix[i][j];
+            }
+            augmented[i][i + n] = 1.0;
+        }
+
+        // Прямой ход метода Гаусса
+        for (size_t i = 0; i < n; i++) {
+            // Поиск главного элемента
+            size_t maxRow = i;
+            for (size_t k = i + 1; k < n; k++) {
+                if (abs(augmented[k][i]) > abs(augmented[maxRow][i])) {
+                    maxRow = k;
+                }
+            }
+            std::swap(augmented[i], augmented[maxRow]);
+
+            // Проверка на вырожденность
+            if (abs(augmented[i][i]) < 1e-10) {
+                throw std::runtime_error("Матрица вырождена");
+            }
+
+            // Нормализация строки
+            double pivot = augmented[i][i];
+            for (size_t j = 0; j < 2 * n; j++) {
+                augmented[i][j] /= pivot;
+            }
+
+            // Обнуление столбца
+            for (size_t k = 0; k < n; k++) {
+                if (k != i) {
+                    double factor = augmented[k][i];
+                    for (size_t j = 0; j < 2 * n; j++) {
+                        augmented[k][j] -= factor * augmented[i][j];
+                    }
+                }
+            }
+        }
+
+        // Извлечение обратной матрицы
+        std::vector<std::vector<double>> result(n, std::vector<double>(n));
+        for (size_t i = 0; i < n; i++) {
+            for (size_t j = 0; j < n; j++) {
+                result[i][j] = augmented[i][j + n];
+            }
+        }
+
+        return result;
+    }
+
+    static double pearsonCorrelation(const std::vector<double>& x, const std::vector<double>& y) {
+        size_t n = x.size();
+        double sum_x = 0, sum_y = 0, sum_xy = 0, sum_x2 = 0, sum_y2 = 0;
+
+        for (size_t i = 0; i < n; i++) {
+            sum_x += x[i];
+            sum_y += y[i];
+            sum_xy += x[i] * y[i];
+            sum_x2 += x[i] * x[i];
+            sum_y2 += y[i] * y[i];
+        }
+
+        double numerator = n * sum_xy - sum_x * sum_y;
+        double denominator = sqrt((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y));
+
+        return (denominator != 0) ? numerator / denominator : 0;
+    }
+};
+
+// Класс для предобработки данных
+class DataPreprocessor {
+public:
+    static std::vector<double> handleMissingValues(const std::vector<double>& column) {
+        std::vector<double> validValues;
+        for (double val : column) {
+            if (!std::isnan(val)) {
+                validValues.push_back(val);
+            }
+        }
+
+        if (validValues.empty()) return column;
+
+        // Вычисляем медиану
+        std::sort(validValues.begin(), validValues.end());
+        double median = validValues[validValues.size() / 2];
+
+        std::vector<double> result = column;
+        for (double& val : result) {
+            if (std::isnan(val)) {
+                val = median;
+            }
+        }
+
+        return result;
+    }
+
+    static std::vector<double> removeOutliers(const std::vector<double>& column) {
+        std::vector<double> sorted = column;
+        std::sort(sorted.begin(), sorted.end());
+
+        size_t n = sorted.size();
+        double q1 = sorted[n / 4];
+        double q3 = sorted[3 * n / 4];
+        double iqr = q3 - q1;
+        double lower_bound = q1 - 1.5 * iqr;
+        double upper_bound = q3 + 1.5 * iqr;
+
+        double median = sorted[n / 2];
+
+        std::vector<double> result = column;
+        for (double& val : result) {
+            if (val < lower_bound || val > upper_bound) {
+                val = median;
+            }
+        }
+
+        return result;
+    }
+
+    static std::vector<double> normalize(const std::vector<double>& column) {
+        double min_val = *std::min_element(column.begin(), column.end());
+        double max_val = *std::max_element(column.begin(), column.end());
+
+        std::vector<double> result;
+        for (double val : column) {
+            if (max_val != min_val) {
+                result.push_back((val - min_val) / (max_val - min_val));
+            }
+            else {
+                result.push_back(0.0);
+            }
+        }
+
+        return result;
+    }
+};
+
+// Класс для отбора признаков
+class FeatureSelector {
+public:
+    static std::vector<int> selectSignificantFeatures(
+        const std::vector<std::vector<double>>& features,
+        const std::vector<double>& target,
+        double threshold = 0.05) {  // Снижаем порог с 0.1 до 0.05
+
+        std::vector<std::pair<int, double>> correlations;
+
+        for (size_t i = 0; i < features.size(); i++) {
+            double correlation = abs(MathUtils::pearsonCorrelation(features[i], target));
+            correlations.push_back({ (int)i, correlation });
+        }
+
+        // Сортируем по убыванию корреляции
+        std::sort(correlations.begin(), correlations.end(),
+            [](const std::pair<int, double>& a, const std::pair<int, double>& b) {
+                return a.second > b.second;
+            });
+
+        std::vector<int> significant;
+
+        // Берем признаки выше порога
+        for (const auto& pair : correlations) {
+            if (pair.second >= threshold) {
+                significant.push_back(pair.first);
+            }
+        }
+
+        // Если ничего не найдено, берем топ-3 лучших признака
+        if (significant.empty() && !correlations.empty()) {
+            size_t count = std::min<size_t>(3, correlations.size());
+            for (int i = 0; i < count; i++) {
+                significant.push_back(correlations[i].first);
+            }
+        }
+
+        return significant;
+    }
+
+    static std::vector<int> removeMulticollinearity(
+        const std::vector<std::vector<double>>& features,
+        const std::vector<int>& indices,
+        double threshold = 0.9) {  // Увеличиваем порог с 0.8 до 0.9
+
+        if (indices.size() <= 1) return indices;  // Добавляем проверку
+
+        std::vector<int> result = indices;
+        std::set<int> toRemove;
+
+        for (size_t i = 0; i < result.size(); i++) {
+            for (size_t j = i + 1; j < result.size(); j++) {
+                double correlation = abs(MathUtils::pearsonCorrelation(
+                    features[result[i]], features[result[j]]));
+                if (correlation > threshold) {
+                    // Удаляем признак с меньшей корреляцией к целевой переменной
+                    toRemove.insert(result[j]);
+                }
+            }
+        }
+
+        result.erase(std::remove_if(result.begin(), result.end(),
+            [&toRemove](int idx) { return toRemove.count(idx) > 0; }), result.end());
+
+        // Гарантируем, что хотя бы один признак останется
+        if (result.empty() && !indices.empty()) {
+            result.push_back(indices[0]);
+        }
+
+        return result;
+    }
+};
+
+// Класс модели регрессии
+class RegressionModel {
+private:
+    std::vector<double> coefficients;
+
+public:
+    RegressionResult fit(const std::vector<std::vector<double>>& X, const std::vector<double>& y,
+        const std::string& method = "OLS", double lambda = 0.01) {
+
+        size_t n = X[0].size(); // количество наблюдений
+        size_t p = X.size();    // количество признаков
+
+        // Добавляем столбец единиц для свободного члена
+        std::vector<std::vector<double>> X_with_intercept(p + 1, std::vector<double>(n));
+        for (size_t i = 0; i < n; i++) {
+            X_with_intercept[0][i] = 1.0; // свободный член
+            for (size_t j = 0; j < p; j++) {
+                X_with_intercept[j + 1][i] = X[j][i];
+            }
+        }
+
+        // Транспонируем для удобства вычислений
+        std::vector<std::vector<double>> X_T = MathUtils::transpose(X_with_intercept);
+        std::vector<std::vector<double>> X_matrix = MathUtils::transpose(X_T);
+
+        // Вычисляем X^T * X
+        std::vector<std::vector<double>> XTX = MathUtils::matrixMultiply(X_matrix, X_T);
+
+        // Для Ridge регрессии добавляем регуляризацию
+        if (method == "Ridge") {
+            for (size_t i = 1; i < XTX.size(); i++) { // не регуляризуем свободный член
+                XTX[i][i] += lambda;
+            }
+        }
+
+        try {
+            // Вычисляем (X^T * X)^(-1)
+            std::vector<std::vector<double>> XTX_inv = MathUtils::inverse(XTX);
+
+            // Вычисляем X^T * y
+            std::vector<double> XTy(p + 1, 0.0);
+            for (size_t i = 0; i < p + 1; i++) {
+                for (size_t j = 0; j < n; j++) {
+                    XTy[i] += X_with_intercept[i][j] * y[j];
+                }
+            }
+
+            // Вычисляем коэффициенты: beta = (X^T * X)^(-1) * X^T * y
+            coefficients.resize(p + 1);
+            for (size_t i = 0; i < p + 1; i++) {
+                coefficients[i] = 0.0;
+                for (size_t j = 0; j < p + 1; j++) {
+                    coefficients[i] += XTX_inv[i][j] * XTy[j];
+                }
+            }
+
+        }
+        catch (const std::exception&) {
+            // Если матрица необратима, используем простой метод
+            coefficients.resize(p + 1, 0.0);
+        }
+
+        // Вычисляем предсказания
+        std::vector<double> predictions(n);
+        for (size_t i = 0; i < n; i++) {
+            predictions[i] = coefficients[0]; // свободный член
+            for (size_t j = 0; j < p; j++) {
+                predictions[i] += coefficients[j + 1] * X[j][i];
+            }
+        }
+
+        // Вычисляем остатки
+        std::vector<double> residuals(n);
+        for (size_t i = 0; i < n; i++) {
+            residuals[i] = y[i] - predictions[i];
+        }
+
+        // Вычисляем R²
+        double y_mean = 0.0;
+        for (double val : y) y_mean += val;
+        y_mean /= n;
+
+        double ss_tot = 0.0, ss_res = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            ss_tot += (y[i] - y_mean) * (y[i] - y_mean);
+            ss_res += residuals[i] * residuals[i];
+        }
+
+        double r_squared = 1.0 - (ss_res / ss_tot);
+
+        // Вычисляем MAPE
+        double mape = 0.0;
+        int valid_count = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (abs(y[i]) > 1e-10) {
+                mape += abs(residuals[i] / y[i]);
+                valid_count++;
+            }
+        }
+        mape = (valid_count > 0) ? (mape / valid_count) * 100.0 : 0.0;
+
+        RegressionResult result;
+        result.coefficients = coefficients;
+        result.r_squared = r_squared;
+        result.mape = mape;
+        result.predictions = predictions;
+        result.residuals = residuals;
+
+        return result;
+    }
+};
+
+// Функции для работы с файлами
+std::vector<std::string> split(const std::string& str, char delimiter) {
+    std::vector<std::string> tokens;
+    std::stringstream ss(str);
+    std::string token;
+
+    while (std::getline(ss, token, delimiter)) {
+        tokens.push_back(token);
+    }
+
+    return tokens;
+}
+
+bool loadCSVFile(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    data.clear();
+    columnNames.clear();
+
+    std::string line;
+    bool first_line = true;
+
+    while (std::getline(file, line)) {
+        std::vector<std::string> row = split(line, ',');
+
+        if (first_line) {
+            columnNames = row;
+            data.resize(row.size());
+            first_line = false;
+        }
+        else {
+            for (size_t i = 0; i < row.size() && i < data.size(); i++) {
+                data[i].push_back(row[i]);
+            }
+        }
+    }
+
+    file.close();
+    return true;
+}
+
+// Функции интерфейса
+void UpdateColumnList() {
+    SendMessage(hColumnList, LB_RESETCONTENT, 0, 0);
+    SendMessage(hTargetCombo, CB_RESETCONTENT, 0, 0);
+
+    for (const std::string& name : columnNames) {
+        std::wstring wname = StringToWString(name);
+        SendMessage(hColumnList, LB_ADDSTRING, 0, (LPARAM)wname.c_str());
+        SendMessage(hTargetCombo, CB_ADDSTRING, 0, (LPARAM)wname.c_str());
+    }
+}
+
+void LoadFile() {
+    OPENFILENAME ofn;
+    wchar_t szFile[260] = { 0 };
+
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hMainWindow;
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile) / sizeof(wchar_t);
+    ofn.lpstrFilter = L"CSV Files\0*.csv\0Excel Files\0*.xlsx\0All Files\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFileTitle = NULL;
+    ofn.nMaxFileTitle = 0;
+    ofn.lpstrInitialDir = NULL;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+
+    if (GetOpenFileName(&ofn)) {
+        std::string filename = WStringToString(szFile);
+        if (loadCSVFile(filename)) {
+            UpdateColumnList();
+            MessageBox(hMainWindow, L"Файл успешно загружен!", L"Успех", MB_OK | MB_ICONINFORMATION);
+        }
+        else {
+            MessageBox(hMainWindow, L"Ошибка загрузки файла!", L"Ошибка", MB_OK | MB_ICONERROR);
+        }
+    }
+}
+
+std::vector<std::string> getSelectedMethods() {
+    std::vector<std::string> methods;
+
+    if (SendMessage(hMethodOLS, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+        methods.push_back("OLS");
+    }
+    if (SendMessage(hMethodRidge, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+        methods.push_back("Ridge");
+    }
+    if (SendMessage(hMethodHuber, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+        methods.push_back("Huber");
+    }
+    if (SendMessage(hMethodWeighted, BM_GETCHECK, 0, 0) == BST_CHECKED) {
+        methods.push_back("Weighted");
+    }
+
+    return methods;
+}
+
+void CalculateRegression() {
+    if (data.empty()) {
+        MessageBox(hMainWindow, L"Сначала загрузите файл с данными!", L"Ошибка", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // Получаем выбранные столбцы
+    std::vector<int> selectedColumns;
+    int count = (int)SendMessage(hColumnList, LB_GETCOUNT, 0, 0);
+    for (int i = 0; i < count; i++) {
+        if (SendMessage(hColumnList, LB_GETSEL, i, 0) > 0) {
+            selectedColumns.push_back(i);
+        }
+    }
+
+    if (selectedColumns.size() < 2) {
+        MessageBox(hMainWindow, L"Выберите минимум 2 столбца для анализа!", L"Ошибка", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // Получаем целевую переменную
+    int targetIndex = (int)SendMessage(hTargetCombo, CB_GETCURSEL, 0, 0);
+    if (targetIndex == CB_ERR) {
+        MessageBox(hMainWindow, L"Выберите целевую переменную!", L"Ошибка", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // Получаем выбранные методы
+    std::vector<std::string> selectedMethods = getSelectedMethods();
+    if (selectedMethods.empty()) {
+        MessageBox(hMainWindow, L"Выберите хотя бы один метод регрессии!", L"Ошибка", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // Получаем параметры
+    wchar_t lambdaText[100];
+    GetWindowText(hLambdaEdit, lambdaText, sizeof(lambdaText) / sizeof(wchar_t));
+    std::string lambdaStr = WStringToString(lambdaText);
+    double lambda = atof(lambdaStr.c_str());
+    if (lambda <= 0) lambda = 0.01;
+
+    try {
+        // Подготавливаем данные
+        std::vector<std::vector<double>> features;
+        std::vector<double> target;
+
+        // Конвертируем целевую переменную
+        for (const std::string& val : data[targetIndex]) {
+            try {
+                target.push_back(std::stod(val));
+            }
+            catch (...) {
+                target.push_back(0.0);
+            }
+        }
+
+        // Конвертируем признаки
+        for (int colIdx : selectedColumns) {
+            if (colIdx != targetIndex) {
+                std::vector<double> feature;
+                for (const std::string& val : data[colIdx]) {
+                    try {
+                        feature.push_back(std::stod(val));
+                    }
+                    catch (...) {
+                        feature.push_back(0.0);
+                    }
+                }
+
+                // Предобработка
+                feature = DataPreprocessor::handleMissingValues(feature);
+                feature = DataPreprocessor::removeOutliers(feature);
+                feature = DataPreprocessor::normalize(feature);
+
+                features.push_back(feature);
+            }
+        }
+
+        if (features.empty()) {
+            MessageBox(hMainWindow, L"Нет подходящих признаков для анализа!", L"Ошибка", MB_OK | MB_ICONERROR);
+            return;
+        }
+
+        // Отбор значимых признаков
+        std::vector<int> significantIndices = FeatureSelector::selectSignificantFeatures(features, target, 0.05);
+        significantIndices = FeatureSelector::removeMulticollinearity(features, significantIndices, 0.9);
+
+        if (significantIndices.empty()) {
+            // Показываем более подробную информацию об ошибке
+            std::stringstream errorMsg;
+            errorMsg << "Не удалось найти подходящие признаки для анализа.\n\n";
+            errorMsg << "Возможные причины:\n";
+            errorMsg << "• Слабая корреляция между признаками и целевой переменной\n";
+            errorMsg << "• Недостаточно данных для анализа\n";
+            errorMsg << "• Проблемы с качеством данных\n\n";
+            errorMsg << "Рекомендации:\n";
+            errorMsg << "• Проверьте правильность выбора целевой переменной\n";
+            errorMsg << "• Убедитесь, что данные содержат числовые значения\n";
+            errorMsg << "• Попробуйте выбрать другие столбцы для анализа";
+
+            std::wstring wErrorMsg = StringToWString(errorMsg.str());
+            MessageBox(hMainWindow, wErrorMsg.c_str(), L"Проблема с данными", MB_OK | MB_ICONWARNING);
+            return;
+        }
+
+        // Фильтруем признаки
+        std::vector<std::vector<double>> filteredFeatures;
+        for (int idx : significantIndices) {
+            filteredFeatures.push_back(features[idx]);
+        }
+
+        // Формируем результаты для всех выбранных методов
+        std::stringstream ss;
+        ss << "=== РЕЗУЛЬТАТЫ МНОЖЕСТВЕННОЙ РЕГРЕССИИ ===\r\n\r\n";
+        ss << "Количество признаков: " << filteredFeatures.size() << "\r\n";
+        ss << "Количество наблюдений: " << target.size() << "\r\n";
+        ss << "Параметр lambda: " << lambda << "\r\n\r\n";
+
+        // Обучаем модели для каждого выбранного метода
+        for (const std::string& method : selectedMethods) {
+            RegressionModel model;
+            RegressionResult result = model.fit(filteredFeatures, target, method, lambda);
+
+            ss << "=== МЕТОД: " << method << " ===\r\n";
+            ss << "КОЭФФИЦИЕНТЫ МОДЕЛИ:\r\n";
+            ss << "Свободный член: " << result.coefficients[0] << "\r\n";
+            for (size_t i = 0; i < significantIndices.size(); i++) {
+                int originalIdx = selectedColumns[significantIndices[i]];
+                if (originalIdx < (int)columnNames.size()) {
+                    ss << columnNames[originalIdx] << ": " << result.coefficients[i + 1] << "\r\n";
+                }
+            }
+
+            ss << "\r\nМЕТРИКИ КАЧЕСТВА:\r\n";
+            ss << "R² (коэффициент детерминации): " << result.r_squared << "\r\n";
+            ss << "MAPE (средняя абсолютная процентная ошибка): " << result.mape << "%\r\n";
+
+            ss << "\r\nОЦЕНКА КАЧЕСТВА:\r\n";
+            if (result.r_squared > 0.7) {
+                ss << "[✓] R² > 0.7 - Хорошее качество модели\r\n";
+            }
+            else {
+                ss << "[✗] R² ≤ 0.7 - Низкое качество модели\r\n";
+            }
+
+            if (result.mape < 10.0) {
+                ss << "[✓] MAPE < 10% - Хорошая точность предсказаний\r\n";
+            }
+            else {
+                ss << "[✗] MAPE ≥ 10% - Низкая точность предсказаний\r\n";
+            }
+
+            ss << "\r\nУРАВНЕНИЕ РЕГРЕССИИ:\r\n";
+            ss << "y = " << result.coefficients[0];
+            for (size_t i = 0; i < significantIndices.size(); i++) {
+                int originalIdx = selectedColumns[significantIndices[i]];
+                if (originalIdx < (int)columnNames.size()) {
+                    double coeff = result.coefficients[i + 1];
+                    if (coeff >= 0) {
+                        ss << " + " << coeff << " × " << columnNames[originalIdx];
+                    }
+                    else {
+                        ss << " + (" << coeff << ") × " << columnNames[originalIdx];
+                    }
+                }
+            }
+            ss << "\r\n\r\n";
+        }
+
+        ss << "ДОПОЛНИТЕЛЬНАЯ ИНФОРМАЦИЯ:\r\n";
+        ss << "Количество значимых признаков: " << significantIndices.size() << "\r\n";
+        ss << "Исходное количество признаков: " << features.size() << "\r\n";
+
+        resultsText = ss.str();
+        std::wstring wResultsText = StringToWString(resultsText);
+        SetWindowText(hResultsEdit, wResultsText.c_str());
+
+        MessageBox(hMainWindow, L"Расчет завершен успешно!", L"Успех", MB_OK | MB_ICONINFORMATION);
+
+    }
+    catch (const std::exception& e) {
+        std::string errorMsg = "Ошибка при расчете: ";
+        errorMsg += e.what();
+        std::wstring wErrorMsg = StringToWString(errorMsg);
+        MessageBox(hMainWindow, wErrorMsg.c_str(), L"Ошибка", MB_OK | MB_ICONERROR);
+    }
+}
+
+void SaveResults() {
+    if (resultsText.empty()) {
+        MessageBox(hMainWindow, L"Нет результатов для сохранения!", L"Ошибка", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    OPENFILENAME ofn;
+    wchar_t szFile[260] = L"results.txt";
+
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hMainWindow;
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile) / sizeof(wchar_t);
+    ofn.lpstrFilter = L"Text Files\0*.txt\0All Files\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrDefExt = L"txt";
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+
+    if (GetSaveFileName(&ofn)) {
+        std::string filename = WStringToString(szFile);
+        std::ofstream file(filename);
+        if (file.is_open()) {
+            file << resultsText;
+            file.close();
+            MessageBox(hMainWindow, L"Результаты успешно сохранены!", L"Успех", MB_OK | MB_ICONINFORMATION);
+        }
+        else {
+            MessageBox(hMainWindow, L"Ошибка сохранения файла!", L"Ошибка", MB_OK | MB_ICONERROR);
+        }
+    }
+}
+
+// Обработчик сообщений окна
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    switch (uMsg) {
+    case WM_CREATE: {
+        // Получаем размеры экрана для адаптивного дизайна
+        RECT screenRect;
+        GetClientRect(hwnd, &screenRect);
+        int screenWidth = screenRect.right;
+        int screenHeight = screenRect.bottom;
+
+        // Заголовок
+        CreateWindow(L"STATIC", L"Анализ множественной регрессии",
+            WS_VISIBLE | WS_CHILD | SS_CENTER,
+            50, 30, screenWidth - 100, 40, hwnd, NULL, NULL, NULL);
+
+        // Кнопка загрузки
+        hLoadButton = CreateWindow(L"BUTTON", L"📁 Загрузить данные",
+            WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+            50, 90, 200, 50, hwnd, (HMENU)ID_LOAD_BUTTON, NULL, NULL);
+
+        // Левая колонка - выбор столбцов
+        CreateWindow(L"STATIC", L"Выберите столбцы для анализа:",
+            WS_VISIBLE | WS_CHILD,
+            50, 160, 250, 25, hwnd, NULL, NULL, NULL);
+
+        hColumnList = CreateWindow(L"LISTBOX", NULL,
+            WS_VISIBLE | WS_CHILD | WS_BORDER | WS_VSCROLL | LBS_MULTIPLESEL,
+            50, 190, 250, 200, hwnd, (HMENU)ID_COLUMN_LIST, NULL, NULL);
+
+        // Средняя колонка - настройки
+        CreateWindow(L"STATIC", L"Целевая переменная:",
+            WS_VISIBLE | WS_CHILD,
+            320, 160, 200, 25, hwnd, NULL, NULL, NULL);
+
+        hTargetCombo = CreateWindow(L"COMBOBOX", NULL,
+            WS_VISIBLE | WS_CHILD | WS_BORDER | CBS_DROPDOWNLIST | WS_VSCROLL,
+            320, 190, 200, 200, hwnd, (HMENU)ID_TARGET_COMBO, NULL, NULL);
+
+        // Методы регрессии с галочками
+        CreateWindow(L"STATIC", L"Методы регрессии:",
+            WS_VISIBLE | WS_CHILD,
+            320, 240, 200, 25, hwnd, NULL, NULL, NULL);
+
+        hMethodOLS = CreateWindow(L"BUTTON", L"OLS (Обычный МНК)",
+            WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+            320, 270, 200, 25, hwnd, (HMENU)ID_METHOD_OLS, NULL, NULL);
+        SendMessage(hMethodOLS, BM_SETCHECK, BST_CHECKED, 0); // По умолчанию выбран
+
+        hMethodRidge = CreateWindow(L"BUTTON", L"Ridge регрессия",
+            WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+            320, 300, 200, 25, hwnd, (HMENU)ID_METHOD_RIDGE, NULL, NULL);
+
+        hMethodHuber = CreateWindow(L"BUTTON", L"Huber регрессия",
+            WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+            320, 330, 200, 25, hwnd, (HMENU)ID_METHOD_HUBER, NULL, NULL);
+
+        hMethodWeighted = CreateWindow(L"BUTTON", L"Взвешенная регрессия",
+            WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+            320, 360, 200, 25, hwnd, (HMENU)ID_METHOD_WEIGHTED, NULL, NULL);
+
+        // Параметр λ с улучшенным выравниванием
+        CreateWindow(L"STATIC", L"Параметр λ (для Ridge):",
+            WS_VISIBLE | WS_CHILD,
+            320, 400, 200, 25, hwnd, NULL, NULL, NULL);
+
+        hLambdaEdit = CreateWindow(L"EDIT", L"0.01",
+            WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
+            320, 430, 200, 30, hwnd, (HMENU)ID_LAMBDA_EDIT, NULL, NULL);
+
+        // Правая колонка - кнопки управления
+        hCalculateButton = CreateWindow(L"BUTTON", L"🔬 Рассчитать",
+            WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+            550, 190, 150, 50, hwnd, (HMENU)ID_CALCULATE_BUTTON, NULL, NULL);
+
+        hSaveButton = CreateWindow(L"BUTTON", L"💾 Сохранить",
+            WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+            550, 260, 150, 50, hwnd, (HMENU)ID_SAVE_BUTTON, NULL, NULL);
+
+        // Область результатов (занимает всю нижнюю часть)
+        CreateWindow(L"STATIC", L"Результаты анализа:",
+            WS_VISIBLE | WS_CHILD,
+            50, 480, 200, 25, hwnd, NULL, NULL, NULL);
+
+        hResultsEdit = CreateWindow(L"EDIT", L"",
+            WS_VISIBLE | WS_CHILD | WS_BORDER | WS_VSCROLL | WS_HSCROLL |
+            ES_MULTILINE | ES_READONLY,
+            50, 510, screenWidth - 100, screenHeight - 560, hwnd, (HMENU)ID_RESULTS_EDIT, NULL, NULL);
+
+        break;
+    }
+
+    case WM_COMMAND: {
+        switch (LOWORD(wParam)) {
+        case ID_LOAD_BUTTON:
+            LoadFile();
+            break;
+        case ID_CALCULATE_BUTTON:
+            CalculateRegression();
+            break;
+        case ID_SAVE_BUTTON:
+            SaveResults();
+            break;
+        }
+        break;
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wParam;
+        SetBkColor(hdc, RGB(240, 248, 255));
+        SetTextColor(hdc, RGB(25, 25, 112));
+        return (LRESULT)CreateSolidBrush(RGB(240, 248, 255));
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = (HDC)wParam;
+        SetBkColor(hdc, RGB(255, 255, 255));
+        SetTextColor(hdc, RGB(0, 0, 0));
+        return (LRESULT)CreateSolidBrush(RGB(255, 255, 255));
+    }
+
+    case WM_CTLCOLORLISTBOX: {
+        HDC hdc = (HDC)wParam;
+        SetBkColor(hdc, RGB(248, 248, 255));
+        SetTextColor(hdc, RGB(0, 0, 0));
+        return (LRESULT)CreateSolidBrush(RGB(248, 248, 255));
+    }
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        break;
+
+    default:
+        return DefWindowProc(hwnd, uMsg, wParam, lParam);
+    }
+    return 0;
+}
+
+// Главная функция
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    SetConsoleCP(CP_UTF8);
+    SetConsoleOutputCP(CP_UTF8);
+
+    // Инициализация общих элементов управления
+    InitCommonControls();
+
+    // Регистрация класса окна
+    const wchar_t* CLASS_NAME = L"RegressionAnalyzer";
+
+    WNDCLASS wc = {};
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    wc.hbrBackground = CreateSolidBrush(RGB(240, 248, 255));
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+
+    RegisterClass(&wc);
+
+    // Получаем размеры экрана для полноэкранного режима
+    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+
+    // Создание главного окна в полноэкранном режиме
+    hMainWindow = CreateWindowEx(
+        0,
+        CLASS_NAME,
+        L"Анализатор множественной регрессии v2.0",
+        WS_OVERLAPPEDWINDOW | WS_MAXIMIZE, // Добавляем WS_MAXIMIZE для полного экрана
+        0, 0, screenWidth, screenHeight,   // Устанавливаем размеры на весь экран
+        NULL, NULL, hInstance, NULL
+    );
+
+    if (hMainWindow == NULL) {
+        return 0;
+    }
+
+    ShowWindow(hMainWindow, SW_MAXIMIZE); // Показываем в максимизированном режиме
+    UpdateWindow(hMainWindow);
+
+    // Цикл сообщений
+    MSG msg = {};
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    return 0;
+}
